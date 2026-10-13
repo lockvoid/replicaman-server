@@ -1,0 +1,25 @@
+.DS_Store
+/target/
+/formal/states/
+/formal/*_TTrace_*
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+local.properties
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Runtime databases and logs.
+*.db
+*.sqlite*
+*.log
+
+# Editor and operating-system files.
+.idea/
+*.iml
