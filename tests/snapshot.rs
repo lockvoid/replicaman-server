@@ -342,6 +342,180 @@ fn construction_and_owner_clock_are_bounded() {
     assert_eq!(snapshot.retry_after(2000), 600);
 }
 
+fn pages_of(snapshot: &mut Snapshot, req: &SnapshotRequest) -> Vec<Vec<CloudEvent>> {
+    let mut next = req.clone();
+    let mut pages = vec![];
+    loop {
+        let page = snapshot.page(&context("alice"), &next, 0).unwrap();
+        pages.push(page.items.clone());
+        if page.next.is_none() {
+            return pages;
+        }
+        next = continuation(req, &page);
+    }
+}
+
+fn pack(items: Vec<CloudEvent>, limit: usize, envelope: usize) -> Vec<Vec<CloudEvent>> {
+    let limits = SnapshotLimits {
+        max_item_bytes: 1_000_000,
+        ..SnapshotLimits::default()
+    };
+    let mut pager = SnapshotPager::new(limit, limits, envelope).unwrap();
+    let mut pages = vec![];
+    for item in items {
+        pages.extend(pager.push(item).unwrap());
+    }
+    pages.push(pager.finish());
+    pages
+}
+
+fn data(pages: &[Vec<CloudEvent>]) -> Vec<Vec<Vec<u8>>> {
+    pages
+        .iter()
+        .map(|page| page.iter().map(|item| item.data().unwrap()).collect())
+        .collect()
+}
+
+#[test]
+fn the_pager_packs_the_same_pages_as_a_whole_snapshot() {
+    let mut req = request();
+    req.kind = SnapshotKind::Create {
+        limit: 3,
+        pending: vec![],
+    };
+    let items: Vec<_> = [300_000, 300_000, 300_000, 1, 2, 3, 4, 900_000, 5]
+        .into_iter()
+        .map(event)
+        .collect();
+    let mut snapshot = build(
+        &req,
+        items.clone(),
+        &TokenKey::random(),
+        SnapshotLimits {
+            max_item_bytes: 1_000_000,
+            ..SnapshotLimits::default()
+        },
+    );
+    let envelope = json_size(&SnapshotResponse {
+        stream: req.stream.clone(),
+        epoch: req.epoch,
+        client: req.client,
+        attempt: req.attempt,
+        snapshot: Uuid::new_v4(),
+        cursor: Position(10),
+        items: vec![],
+        next: Some("A".repeat(TOKEN_LEN)),
+        ttl: 600,
+        ops: vec![],
+    })
+    .unwrap();
+    let whole = pages_of(&mut snapshot, &req);
+    let streamed = pack(items, 3, envelope);
+    assert_eq!(data(&streamed), data(&whole));
+    let fresh: Vec<_> = streamed.iter().flatten().map(CloudEvent::id).collect();
+    assert_eq!(
+        fresh.iter().collect::<std::collections::HashSet<_>>().len(),
+        fresh.len()
+    );
+}
+
+#[test]
+fn reserved_pages_fit_any_attempt_with_the_largest_outcomes() {
+    let stream = "catalog/1234567890";
+    let reserve = envelope_reserve(stream).unwrap();
+    // Items much smaller than the outcomes' size fill each page to within one
+    // item of PAGE_BYTES, so a reserve without `ops` would overflow below.
+    let pages = pack(
+        (0..300).map(|index| event(9_000 + index)).collect(),
+        100,
+        reserve,
+    );
+    assert!(pages.len() > 1);
+    assert!(pages.iter().all(|page| page.len() < 100));
+    let ops: Vec<_> = (0..MAX_PENDING)
+        .map(|_| SnapshotOp {
+            op: Uuid::new_v4(),
+            hash: "f".repeat(64),
+            coverage: Coverage::Accepted {
+                cursor: Position(i64::MAX as u64),
+                result: Accepted::Noop {
+                    reason: "z".repeat(64),
+                },
+            },
+        })
+        .collect();
+    let key = TokenKey::random();
+    let req = SnapshotRequest {
+        stream: stream.into(),
+        ..request()
+    };
+    for (index, items) in pages.iter().enumerate() {
+        let response = SnapshotResponse {
+            stream: stream.into(),
+            epoch: req.epoch,
+            client: req.client,
+            attempt: req.attempt,
+            snapshot: Uuid::new_v4(),
+            cursor: Position(i64::MAX as u64),
+            items: items.clone(),
+            next: Some(
+                key.page_token(&context("alice"), &req, Uuid::new_v4(), index + 1)
+                    .unwrap(),
+            ),
+            ttl: u16::MAX,
+            ops: ops.clone(),
+        };
+        assert!(json_size(&response).unwrap() <= PAGE_BYTES);
+    }
+}
+
+#[test]
+fn page_tokens_have_one_width_and_verify_for_their_index() {
+    let req = request();
+    let key = TokenKey::random();
+    let id = Uuid::new_v4();
+    for index in [0, 1, 511, u32::MAX as usize] {
+        let token = key.page_token(&context("alice"), &req, id, index).unwrap();
+        assert_eq!(token.len(), TOKEN_LEN);
+        let page = SnapshotRequest {
+            kind: SnapshotKind::Page {
+                snapshot: id,
+                page: token,
+                limit: None,
+            },
+            ..req.clone()
+        };
+        assert_eq!(key.verify(&context("alice"), &page).unwrap(), Some(index));
+    }
+}
+
+#[test]
+fn an_empty_cut_is_one_empty_page_and_limits_hold_while_streaming() {
+    let limits = SnapshotLimits {
+        max_items: 2,
+        max_data_bytes: 10,
+        max_item_bytes: 6,
+    };
+    assert!(
+        SnapshotPager::new(1, limits, 100)
+            .unwrap()
+            .finish()
+            .is_empty()
+    );
+    let mut pager = SnapshotPager::new(1, limits, 100).unwrap();
+    assert!(pager.push(event(6)).unwrap().is_none());
+    assert_eq!(pager.push(event(4)).unwrap().unwrap().len(), 1);
+    let error = pager.push(event(1)).unwrap_err();
+    assert_eq!(error.error, ErrorCode::StoragePressure);
+    let mut large = SnapshotPager::new(1, limits, 100).unwrap();
+    assert_eq!(
+        large.push(event(7)).unwrap_err().error,
+        ErrorCode::StoragePressure
+    );
+    assert!(SnapshotPager::new(0, limits, 100).is_err());
+    assert!(SnapshotPager::new(1, limits, MAX_BODY_BYTES).is_err());
+}
+
 #[test]
 fn old_signed_page_cannot_read_a_recreated_attempt() {
     let req = request();

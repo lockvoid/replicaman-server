@@ -429,6 +429,7 @@ async fn error_status_epoch_and_retry_after_are_preserved() {
         );
         let response = app.oneshot(request("pull", PULL)).await.unwrap();
         assert_eq!(response.status().as_u16(), error.status());
+        assert_eq!(response.extensions().get::<ErrorCode>(), Some(&error.error));
         if let Some(retry) = error.retry_after {
             assert_eq!(response.headers()[header::RETRY_AFTER], retry.to_string());
         }

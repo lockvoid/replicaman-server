@@ -42,7 +42,10 @@ impl TokenKey {
         mac.update(&binding);
         Ok(mac)
     }
-    fn sign(
+    /// The opaque continuation of page `index` of snapshot `id` for this
+    /// attempt. A page's own bytes never include its token, so an owner may
+    /// store one image and sign its pages for every attempt that publishes it.
+    pub fn page_token(
         &self,
         context: &Context,
         request: &SnapshotRequest,
@@ -99,6 +102,111 @@ impl Default for SnapshotLimits {
             max_data_bytes: 64 * 1024 * 1024,
             max_item_bytes: 512 * 1024,
         }
+    }
+}
+
+/// Length of every page token: version prefix and a base64url index and tag.
+pub const TOKEN_LEN: usize = 2 + 48;
+
+/// The largest page envelope any attempt on `stream` can have: fixed-width
+/// identifiers, position and token, and the largest outcome for every allowed
+/// pending operation. Pages packed with this reserve fit each attempt that
+/// publishes one shared image, whatever its own `ops`.
+pub fn envelope_reserve(stream: &str) -> Result<usize> {
+    let op = SnapshotOp {
+        op: Uuid::nil(),
+        hash: "0".repeat(64),
+        coverage: Coverage::Accepted {
+            cursor: Position(i64::MAX as u64),
+            result: Accepted::Noop {
+                reason: "a".repeat(64),
+            },
+        },
+    };
+    json_size(&SnapshotResponse {
+        stream: stream.into(),
+        epoch: Uuid::nil(),
+        client: Uuid::nil(),
+        attempt: Uuid::nil(),
+        snapshot: Uuid::nil(),
+        cursor: Position(i64::MAX as u64),
+        items: vec![],
+        next: Some("A".repeat(TOKEN_LEN)),
+        ttl: u16::MAX,
+        ops: vec![op; MAX_PENDING],
+    })
+}
+
+/// Packs a cut into pages one item at a time, so an owner can store each page
+/// as soon as it is complete instead of holding the whole image. Every page has
+/// at most `limit` items and fits `PAGE_BYTES` with `envelope_bytes` reserved;
+/// one oversized item still forms its own page within `MAX_BODY_BYTES`.
+pub struct SnapshotPager {
+    limit: usize,
+    limits: SnapshotLimits,
+    envelope_bytes: usize,
+    items: usize,
+    data_bytes: usize,
+    current: Vec<CloudEvent>,
+    current_bytes: usize,
+}
+impl SnapshotPager {
+    pub fn new(limit: usize, limits: SnapshotLimits, envelope_bytes: usize) -> Result<Self> {
+        if limit == 0
+            || limits.max_items == 0
+            || limits.max_items > u32::MAX as usize
+            || limits.max_item_bytes == 0
+            || limits.max_item_bytes > MAX_DATA_BYTES
+            || limits.max_data_bytes == 0
+            || envelope_bytes >= MAX_BODY_BYTES
+        {
+            return Err(Error::internal());
+        }
+        Ok(Self {
+            limit,
+            limits,
+            envelope_bytes,
+            items: 0,
+            data_bytes: 0,
+            current: Vec::new(),
+            current_bytes: 0,
+        })
+    }
+    /// Adds the next item of the cut, in cut order, under a fresh ID. Returns
+    /// the previous page when this item starts a new one; items are never split.
+    pub fn push(&mut self, item: CloudEvent) -> Result<Option<Vec<CloudEvent>>> {
+        item.validate().map_err(|_| Error::internal())?;
+        self.items += 1;
+        let bytes = item.data()?.len();
+        self.data_bytes = self
+            .data_bytes
+            .checked_add(bytes)
+            .ok_or_else(Error::internal)?;
+        if self.items > self.limits.max_items
+            || bytes > self.limits.max_item_bytes
+            || self.data_bytes > self.limits.max_data_bytes
+        {
+            return Err(Error::new(ErrorCode::StoragePressure));
+        }
+        let item = item.with_id(Uuid::new_v4())?;
+        let bytes = json_size(&item)?;
+        if self.envelope_bytes + bytes > MAX_BODY_BYTES {
+            return Err(Error::internal());
+        }
+        let page = (!self.current.is_empty()
+            && (self.current.len() == self.limit
+                || self.envelope_bytes + self.current_bytes + 1 + bytes > PAGE_BYTES))
+            .then(|| {
+                self.current_bytes = 0;
+                std::mem::take(&mut self.current)
+            });
+        self.current_bytes += bytes + usize::from(!self.current.is_empty());
+        self.current.push(item);
+        Ok(page)
+    }
+    /// The last page. An empty cut is one empty page.
+    pub fn finish(self) -> Vec<CloudEvent> {
+        self.current
     }
 }
 
@@ -201,43 +309,22 @@ impl Snapshot {
             tokens: vec![],
             ops,
         };
-        let mut total = 0usize;
-        let mut current = Vec::new();
-        let mut current_bytes = 0usize;
         // Every signed token has the same width. Count the envelope once instead
         // of repeatedly cloning/serializing a growing page of application data.
-        let token = key.sign(context, request, result.id, 1)?;
+        let token = key.page_token(context, request, result.id, 1)?;
         let envelope_bytes = json_size(&result.response(vec![], Some(token), 600))?;
+        let mut pager = SnapshotPager::new(result.limit, limits, envelope_bytes)?;
         for item in cut.items {
             context.check()?;
-            item.validate().map_err(|_| Error::internal())?;
-            let bytes = item.data()?.len();
-            total = total.checked_add(bytes).ok_or_else(Error::internal)?;
-            if bytes > limits.max_item_bytes || total > limits.max_data_bytes {
-                return Err(Error::new(ErrorCode::StoragePressure));
+            if let Some(page) = pager.push(item)? {
+                result.pages.push(page);
             }
-            let item = item.with_id(Uuid::new_v4())?;
-            let bytes = json_size(&item)?;
-            if !current.is_empty()
-                && (current.len() == result.limit
-                    || envelope_bytes + current_bytes + 1 + bytes > PAGE_BYTES)
-            {
-                result.pages.push(std::mem::take(&mut current));
-                current_bytes = 0;
-            }
-            if envelope_bytes + bytes > MAX_BODY_BYTES {
-                return Err(Error::internal());
-            }
-            current_bytes += bytes + usize::from(!current.is_empty());
-            current.push(item);
         }
-        if !current.is_empty() || result.pages.is_empty() {
-            result.pages.push(current);
-        }
+        result.pages.push(pager.finish());
         for index in 0..result.pages.len() {
             result
                 .tokens
-                .push(key.sign(context, request, result.id, index)?);
+                .push(key.page_token(context, request, result.id, index)?);
         }
         context.check()?;
         Ok(result)

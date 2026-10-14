@@ -373,6 +373,8 @@ fn error_response_with_status(error: Error, status: StatusCode) -> Response {
     let body = serde_json::to_vec(&error).expect("protocol errors serialize to JSON");
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
+    // Host telemetry tells expected backpressure from failures by the code.
+    response.extensions_mut().insert(error.error);
     if let Some(seconds) = retry_after {
         response.headers_mut().insert(
             header::RETRY_AFTER,

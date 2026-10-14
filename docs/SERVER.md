@@ -46,6 +46,7 @@ Use `http::router(backend, authenticator)` in an Axum application. Serve it behi
 | `engine::ReadTransaction` | Check access and epoch and read metadata, events, and receipts from one consistent stream state. Return a complete ordered event prefix. |
 | `engine::WriteTransaction` | Serialize commits; include domain data, jobs, event, head, and receipt in one transaction. Roll back on error or panic. |
 | `snapshot::Snapshot` | Store bounded immutable pages; look up an active attempt before admission, coalesce creation, and preserve promised expiry. |
+| `snapshot::SnapshotPager` | Pack a cut into pages while reading it, so each page is stored as soon as it is complete. |
 
 For a Rust data owner, call `engine::push` or `engine::pull` inside these transactions. Commit only a successful result, after enforcing `Context::deadline` at the owner. `begin_application` and `rollback_application` form a savepoint over both domain data and external jobs: an application rejection saves only its receipt, while a noop publishes one event without changing the base.
 
@@ -65,6 +66,10 @@ Exceeding the 10-second snapshot build budget returns 503 `snapshot_busy` with `
 2. Return the current active attempt before checking quotas. For a new attempt, reserve bounded capacity and capture `SnapshotCut` from one consistent data/head state.
 3. Recheck authority and read `engine::coverage` in the publication transaction. The cut may precede these receipt reads; an accepted position above the cut arrives through the log.
 4. Build `Snapshot::new`, persist it, and use `Snapshot::page` for both creation retries and continuation. Commit renewal only after successful checks. Expired/lost images release capacity; an abandoned but active image retains its slot until expiry.
+
+An owner may instead build one image per `(stream, epoch, head, limit)` and publish it for many attempts. Pack it with `SnapshotPager` using `envelope_reserve(stream)`, store the pages without their envelope, and assemble each response from the attempt: its own `snapshot` ID, its `ops` from receipts read at its publication, and `TokenKey::page_token` for `next`. Reuse a finished image only while its epoch and head equal the stream's current state and enough of its 24-hour lifetime remains; check quotas for every new attempt, and let one builder per key hold the build so concurrent requests wait instead of duplicating it.
+
+Error responses carry their `ErrorCode` as a response extension, so host telemetry can tell expected backpressure such as `snapshot_busy` from failures.
 
 Use a trusted nondecreasing owner clock for millisecond arguments. Persist `TokenKey` securely for the lifetime of the served epochs; all serving nodes need the same key. Its signed opaque tokens bind subject, stream, epoch, installation, attempt, snapshot, and page. No permanent snapshot receipt is required.
 

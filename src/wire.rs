@@ -20,6 +20,8 @@ pub const MAX_DATA_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_BODY_BYTES: usize = 48 * 1024 * 1024;
 pub const PAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
+/// Operations a snapshot creation may ask outcomes for.
+pub const MAX_PENDING: usize = 100;
 const MAX_BASE64_BYTES: usize = MAX_DATA_BYTES.div_ceil(3) * 4;
 const DEFAULT_LIMIT: usize = 100;
 
@@ -303,7 +305,7 @@ pub fn validate_snapshot(request: &SnapshotRequest) -> Result<()> {
     match &request.kind {
         SnapshotKind::Create { limit, pending } => {
             validate_limit(*limit)?;
-            if pending.len() > 100 {
+            if pending.len() > MAX_PENDING {
                 return Err(Error::bad_request());
             }
             let mut seen = HashSet::new();
